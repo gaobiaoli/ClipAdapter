@@ -15,12 +15,12 @@ class DirDataset:
         self.transform = transform
         self.label_list = []
         self.img_list = []
-        self.classnames = class_dir_map.keys()
+        self.classnames = list(class_dir_map.keys())
         self.label2img = {}
         self.img2label = {}
         if random_seed is not None:
             random.seed(random_seed)
-        for id, classname in enumerate(class_dir_map.keys()):
+        for id, classname in enumerate(list(class_dir_map.keys())):
             dir_path = os.path.join(self.root, class_dir_map[classname])
             imgs_file = os.listdir(dir_path)
             files = [os.path.join(dir_path, img) for img in imgs_file]
@@ -32,7 +32,7 @@ class DirDataset:
 
     def gen_fewshot_ids(self, shot=1):
         shotImgs = []
-        for catId in self.label2img.keys():
+        for catId in list(self.label2img.keys()):
             imgs = self.label2img[catId]
             random.shuffle(imgs)
             shotImgs.extend(imgs[0:shot])
