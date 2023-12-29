@@ -1,3 +1,4 @@
+import warnings
 import torch
 import clip
 import torch.nn as nn
@@ -10,12 +11,13 @@ class ClipAdapter:
     def __init__(
         self,
         model,
-        dataloader,
-        classnames,
+        dataloader=None,
+        classnames=None,
         alpha=20,
         beta=20,
         augment_epoch=10,
         device="cuda:0",
+        manual_cache=False,
     ) -> None:
         self.model = model
         self.alpha = alpha
@@ -25,8 +27,10 @@ class ClipAdapter:
         self.device = device
 
         self.text_features = self._encoder_text()
-
-        self.cache_keys, self.cache_values = self._bulid_cache(dataloader,self.cfg["augment_epoch"])
+        if not manual_cache:
+            self.cache_keys, self.cache_values = self._bulid_cache(
+                dataloader, self.cfg["augment_epoch"]
+            )
 
     def reset_text(self, texts):
         self.classnames = texts
@@ -39,7 +43,7 @@ class ClipAdapter:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
 
-    def _bulid_cache(self, dataloader,augment_epoch):
+    def _bulid_cache(self, dataloader, augment_epoch):
         cache_keys = []
         cache_values = []
 
@@ -48,12 +52,8 @@ class ClipAdapter:
             for augment_idx in range(augment_epoch):
                 train_features = []
 
-                print(
-                    "Augment Epoch: {:} / {:}".format(
-                        augment_idx, augment_epoch
-                    )
-                )
-                for i, (images, target) in enumerate(tqdm(dataloader)):
+                print("Augment Epoch: {:} / {:}".format(augment_idx, augment_epoch))
+                for i, (images, target, _) in enumerate(tqdm(dataloader)):
                     image_features = self.model.encode_image(images.to(self.device))
                     train_features.append(image_features)
                     if augment_idx == 0:
@@ -68,16 +68,49 @@ class ClipAdapter:
 
         return cache_keys, cache_values
 
-    def rebulid_cache(self, dataloader,augment_epoch=None):
+    def add_cache(self, img_feature, label):
+        """
+        img_feature: output from Clip encode_image, need normlization in dim=-1, shape: batch_size * feature_dim
+        """
+        assert img_feature.shape[0] == label.shape[0]
+        one_hot = (
+            F.one_hot(label, num_classes=len(self.classnames)).half().to(self.device)
+        )
+        if not hasattr(self, "cache_keys"):
+            self.cache_keys = img_feature.t()
+            self.cache_values = one_hot
+        else:
+            self.cache_keys = torch.cat([self.cache_keys, img_feature.t()], dim=1)
+            self.cache_values = torch.cat([self.cache_values, one_hot], dim=0)
+
+    def cal_entropy(self):
+        self.entropy = F.cross_entropy(
+            100 * self.cache_keys.t() @ self.text_features.t(),
+            self.cache_values.argmax(dim=-1),
+            reduction="none",
+        )
+        return self.entropy
+
+    def clear_cache(self):
+        if hasattr(self, "cache_keys"):
+            del self.cache_keys
+            del self.cache_values
+            return True
+        else:
+            return False
+
+    def rebulid_cache(self, dataloader, augment_epoch=None):
         if augment_epoch is None:
-            augment_epoch=self.cfg["augment_epoch"]
-        self.cache_keys, self.cache_values=self._bulid_cache(dataloader=dataloader,augment_epoch=augment_epoch)
+            augment_epoch = self.cfg["augment_epoch"]
+        self.cache_keys, self.cache_values = self._bulid_cache(
+            dataloader=dataloader, augment_epoch=augment_epoch
+        )
 
     def pre_load_features(self, dataloader, store=True):
         features, labels = [], []
 
         with torch.no_grad():
-            for i, (images, target) in enumerate(tqdm(dataloader)):
+            for i, (images, target, _) in enumerate(tqdm(dataloader)):
                 images, target = images.to(self.device), target.to(self.device)
                 image_features = self.model.encode_image(images)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
@@ -91,26 +124,33 @@ class ClipAdapter:
             self.test_clip_logits = 100.0 * features @ self.text_features.t()
         return features, labels
 
-    def eval(self, dataloader=None):
+    def eval(self, dataloader=None, adapt=True, alpha=None, beta=None):
+        if alpha is None:
+            alpha = self.cfg["alpha"]
+        if beta is None:
+            beta = self.cfg["beta"]
         if dataloader is not None:
             all_targets = []
             all_predictions = []
             with torch.no_grad():
-                for i, (imgs, label) in enumerate(tqdm(dataloader)):
-                    logits = self.__call__(imgs.to(self.device), adapt=True)
+                for i, (imgs, label, _) in enumerate(tqdm(dataloader)):
+                    logits = self.__call__(imgs.to(self.device), adapt=adapt)
                     probs = logits.softmax(dim=-1)
                     pred_label = probs.argmax(dim=1)
                     all_targets.extend(label.cpu().numpy())
                     all_predictions.extend(pred_label.cpu().numpy())
             return all_predictions, all_targets
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
-            fused_logits = self._fuse_logits(
-                self.test_features,
-                self.test_clip_logits,
-                alpha=self.cfg["alpha"],
-                beta=self.cfg["beta"],
-            )
-            all_predictions = fused_logits.softmax(dim=-1).argmax(dim=1)
+            if adapt:
+                fused_logits = self._fuse_logits(
+                    self.test_features,
+                    self.test_clip_logits,
+                    alpha=alpha,
+                    beta=beta,
+                )
+                all_predictions = fused_logits.softmax(dim=-1).argmax(dim=1)
+            else:
+                all_predictions = self.test_clip_logits.softmax(dim=-1).argmax(dim=1)
             return all_predictions.cpu().numpy(), self.test_labels.cpu().numpy()
 
     def train_keys(self, dataloader, epoch=10, dataloader_eval=None):
@@ -119,9 +159,8 @@ class ClipAdapter:
                 dataloader=dataloader_eval
             )
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
-            test_features, test_labels = self.test_features,self.test_labels
-            
-        
+            test_features, test_labels = self.test_features, self.test_labels
+
         # Enable the cached keys to be learnable
         adapter = nn.Linear(
             self.cache_keys.shape[0], self.cache_keys.shape[1], bias=False
@@ -143,7 +182,7 @@ class ClipAdapter:
             loss_list = []
             print("Train Epoch: {:} / {:}".format(train_idx, epoch))
 
-            for i, (images, target) in enumerate(tqdm(dataloader)):
+            for i, (images, target, _) in enumerate(tqdm(dataloader)):
                 images, target = images.to(self.device), target.to(self.device)
                 with torch.no_grad():
                     image_features = self.model.encode_image(images)
@@ -201,15 +240,16 @@ class ClipAdapter:
         )
 
     def search_hp(
-        self, dataloader=None, search_scale=[50, 50], search_step=[200, 20], inplace=True
+        self,
+        dataloader=None,
+        search_scale=[50, 50],
+        search_step=[200, 20],
+        inplace=True,
     ):
-        
         if dataloader is not None:
-            features, labels = self.pre_load_features(
-                dataloader=dataloader
-            )
+            features, labels = self.pre_load_features(dataloader=dataloader)
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
-            features, labels = self.test_features,self.test_labels
+            features, labels = self.test_features, self.test_labels
         beta_list = [
             i * (search_scale[0] - 0.1) / search_step[0] + 0.1
             for i in range(search_step[0])
@@ -254,13 +294,21 @@ class ClipAdapter:
 
     def _fuse_logits(self, image_featrues, clip_logits, alpha, beta):
         with torch.no_grad():
-            affinity = image_featrues @ self.cache_keys
-            cache_logits = ((-1) * beta * (1 - affinity)).exp() @ self.cache_values
-            tip_logits = clip_logits + cache_logits * alpha
-            return tip_logits
+            if hasattr(self, "cache_keys") and hasattr(self, "cache_values"):
+                affinity = image_featrues @ self.cache_keys
+                cache_logits = ((-1) * beta * (1 - affinity)).exp() @ self.cache_values
+                tip_logits = clip_logits + cache_logits * alpha
+                return tip_logits
+            else:
+                warnings.warn("No Cached Error, Turn to Plain Mode")
+                return clip_logits
 
     @torch.no_grad()
-    def __call__(self, images, adapt=True):
+    def __call__(self, images, adapt=True, alpha=None, beta=None):
+        if alpha is None:
+            alpha = self.cfg["alpha"]
+        if beta is None:
+            beta = self.cfg["beta"]
         images = images.to(self.device)
         image_features = self.model.encode_image(images)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -269,8 +317,8 @@ class ClipAdapter:
             fused_logits = self._fuse_logits(
                 image_featrues=image_features,
                 clip_logits=clip_logits,
-                alpha=self.cfg["alpha"],
-                beta=self.cfg["beta"],
+                alpha=alpha,
+                beta=beta,
             )
             return fused_logits.softmax(dim=-1)
         return clip_logits.softmax(dim=-1)
