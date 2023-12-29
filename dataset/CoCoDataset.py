@@ -1,6 +1,7 @@
 import os
 import cv2
 import random
+import torch
 from PIL import Image
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
@@ -14,21 +15,26 @@ class CocoDataset(Dataset):
         few_shot=None,
         random_seed=None,
         ratio=None,
-        category_init_id=1
+        category_init_id=1,
+        instance_ids=None
     ) -> None:
         super().__init__()
         self.coco = COCO(coco_json)
+        self.random_seed=random_seed
+        if random_seed is not None:
+            random.seed(random_seed)
         self.imgs_path = imgs_path
         self.transform = transform
         self.shot = False
-        self.instance_ids = self.coco.getAnnIds()
-        if random_seed is not None:
-            random.seed(random_seed)
-        if few_shot is not None:
-            self.instance_ids = self.gen_fewshot_ids(few_shot)
-            self.shot = True
-        elif ratio is not None:
-            self.instance_ids = self.gen_part_ids(ratio)
+        if instance_ids is None:
+            self.instance_ids = self.coco.getAnnIds()
+            if few_shot is not None:
+                self.instance_ids = self.gen_fewshot_ids(few_shot)
+                self.shot = True
+            elif ratio is not None:
+                self.instance_ids = self.gen_part_ids(ratio)
+        else:
+            self.instance_ids=instance_ids
         self.category_init_id=category_init_id
     @property
     def classnames(self):
@@ -38,7 +44,9 @@ class CocoDataset(Dataset):
     def classnames_clip(self):
         return [f"a photo of {classname}" for classname in self.classnames]
 
-    def gen_fewshot_ids(self, shot=1):
+    def gen_fewshot_ids(self, shot=1, random_seed=None):
+        if random_seed is not None:
+            random.seed(random_seed)
         shotIds = []
         for catId in self.coco.getCatIds():
             annIds = self.coco.getAnnIds(catIds=[catId])
@@ -73,8 +81,8 @@ class CocoDataset(Dataset):
         )
         if self.transform is not None:
             instance_tensor = self.transform(Image.fromarray(instance))
-            return instance_tensor, anns["category_id"] - self.category_init_id
-        return instance, anns["category_id"] - self.category_init_id
+            return instance_tensor, anns["category_id"] - self.category_init_id, self.instance_ids[index]
+        return instance, anns["category_id"] - self.category_init_id, self.instance_ids[index]
     def __len__(self):
         return len(self.instance_ids)
 
