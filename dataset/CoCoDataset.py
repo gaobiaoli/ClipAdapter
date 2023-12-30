@@ -37,7 +37,7 @@ class CoCoDataset(Dataset):
         else:
             self.instance_ids = instance_ids
         self.category_init_id = category_init_id
-
+    
     @property
     def classnames(self):
         return [category["name"] for category in self.coco.dataset["categories"]]

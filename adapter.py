@@ -133,14 +133,14 @@ class ClipAdapter:
             all_targets = []
             all_predictions = []
             with torch.no_grad():
-                for i, (imgs, label, _) in enumerate(tqdm(dataloader)):
+                for i, (imgs, label, _ ) in enumerate(tqdm(dataloader)):
                     logits = self.__call__(imgs.to(self.device), adapt=adapt)
                     probs = logits.softmax(dim=-1)
                     pred_label = probs.argmax(dim=1)
                     all_targets.extend(label.cpu().numpy())
                     all_predictions.extend(pred_label.cpu().numpy())
-            return all_predictions, all_targets
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
+            all_targets=self.test_labels.cpu().numpy()
             if adapt:
                 fused_logits = self._fuse_logits(
                     self.test_features,
@@ -148,10 +148,14 @@ class ClipAdapter:
                     alpha=alpha,
                     beta=beta,
                 )
-                all_predictions = fused_logits.softmax(dim=-1).argmax(dim=1)
+                all_predictions = fused_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
             else:
-                all_predictions = self.test_clip_logits.softmax(dim=-1).argmax(dim=1)
-            return all_predictions.cpu().numpy(), self.test_labels.cpu().numpy()
+                all_predictions = self.test_clip_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
+        accuracy = metrics.accuracy_score(all_targets, all_predictions)
+        precision = metrics.precision_score(all_targets, all_predictions, average=None)
+        recall = metrics.recall_score(all_targets, all_predictions, average=None)
+        f1 = metrics.f1_score(all_targets, all_predictions, average=None)
+        return all_predictions, all_targets,(accuracy,precision,recall,f1)
 
     def train_keys(self, dataloader, epoch=10, dataloader_eval=None):
         if dataloader_eval is not None:
