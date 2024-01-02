@@ -133,14 +133,14 @@ class ClipAdapter:
             all_targets = []
             all_predictions = []
             with torch.no_grad():
-                for i, (imgs, label, _ ) in enumerate(tqdm(dataloader)):
+                for i, (imgs, label, _) in enumerate(tqdm(dataloader)):
                     logits = self.__call__(imgs.to(self.device), adapt=adapt)
                     probs = logits.softmax(dim=-1)
                     pred_label = probs.argmax(dim=1)
                     all_targets.extend(label.cpu().numpy())
                     all_predictions.extend(pred_label.cpu().numpy())
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
-            all_targets=self.test_labels.cpu().numpy()
+            all_targets = self.test_labels.cpu().numpy()
             if adapt:
                 fused_logits = self._fuse_logits(
                     self.test_features,
@@ -148,16 +148,27 @@ class ClipAdapter:
                     alpha=alpha,
                     beta=beta,
                 )
-                all_predictions = fused_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
+                all_predictions = (
+                    fused_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
+                )
             else:
-                all_predictions = self.test_clip_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
+                all_predictions = (
+                    self.test_clip_logits.softmax(dim=-1).argmax(dim=1).cpu().numpy()
+                )
         accuracy = metrics.accuracy_score(all_targets, all_predictions)
         precision = metrics.precision_score(all_targets, all_predictions, average=None)
         recall = metrics.recall_score(all_targets, all_predictions, average=None)
         f1 = metrics.f1_score(all_targets, all_predictions, average=None)
-        return all_predictions, all_targets,(accuracy,precision,recall,f1)
+        return all_predictions, all_targets, (accuracy, precision, recall, f1)
 
-    def train_keys(self, dataloader, epoch=10, dataloader_eval=None):
+    def train_keys(
+        self,
+        dataloader,
+        epoch=10,
+        dataloader_eval=None,
+        search_hp=True,
+        alpha_train=False,
+    ):
         if dataloader_eval is not None:
             test_features, test_labels = self.pre_load_features(
                 dataloader=dataloader_eval
@@ -170,13 +181,31 @@ class ClipAdapter:
             self.cache_keys.shape[0], self.cache_keys.shape[1], bias=False
         ).to(self.device)
         adapter.weight = nn.Parameter(self.cache_keys.t())
+        if alpha_train:
+            self.alpha_matrix = nn.Linear(
+                self.cache_values.shape[1], self.cache_values.shape[1], bias=False
+            ).to(self.device)
+            self.alpha_matrix.weight = nn.Parameter(
+                torch.diag(
+                    torch.tensor(
+                        [self.cfg["alpha"]] * self.cache_values.shape[1]
+                    ).half()
+                ).to(self.device)
+            )
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": self.alpha_matrix.parameters(), "lr": 0.01},
+                    {"params": adapter.parameters(), "lr": 0.001 * 0.01},
+                ],
+                eps=1e-4,
+            )
+        else:
+            optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.001, eps=1e-4)
 
-        optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.001, eps=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, epoch * len(dataloader)
         )
 
-        beta, alpha = self.cfg["beta"], self.cfg["alpha"]
         best_acc, best_epoch = 0.0, 0
 
         for train_idx in range(epoch):
@@ -194,12 +223,20 @@ class ClipAdapter:
 
                 affinity = adapter(image_features)
                 cache_logits = (
-                    (-1) * (beta - beta * affinity)
+                    (-1) * (self.cfg["beta"] - self.cfg["beta"] * affinity)
                 ).exp() @ self.cache_values
+                #
+                # clip_logits = 100.0 * image_features @ self.text_features.t()
+                # fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
+                # loss = F.cross_entropy(fused_logits, target)
+                #
                 clip_logits = 100.0 * image_features @ self.text_features.t()
-                fused_logits = clip_logits + cache_logits * alpha
-
+                if alpha_train:
+                    fused_logits = clip_logits + self.alpha_matrix(cache_logits)
+                else:
+                    fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
                 loss = F.cross_entropy(fused_logits, target)
+                #
                 probs = fused_logits.softmax(dim=-1)
                 pred_label = probs.argmax(dim=1)
                 accuracy = metrics.accuracy_score(
@@ -224,12 +261,19 @@ class ClipAdapter:
                     sum(loss_list) / len(loss_list),
                 )
             )
+            if search_hp:
+                self.search_hp()
 
             adapter.eval()
             affinity = adapter(test_features)
-            cache_logits = ((-1) * (beta - beta * affinity)).exp() @ self.cache_values
+            cache_logits = (
+                (-1) * (self.cfg["beta"] - self.cfg["beta"] * affinity)
+            ).exp() @ self.cache_values
             clip_logits = 100.0 * test_features @ self.text_features.t()
-            fused_logits = clip_logits + cache_logits * alpha
+            if alpha_train:
+                fused_logits = clip_logits + self.alpha_matrix(cache_logits)
+            else:
+                fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
             probs = fused_logits.softmax(dim=-1)
             pred_label = probs.argmax(dim=1)
             accuracy = metrics.accuracy_score(
@@ -249,6 +293,7 @@ class ClipAdapter:
         search_scale=[50, 50],
         search_step=[200, 20],
         inplace=True,
+        alpha_train=False,
     ):
         if dataloader is not None:
             features, labels = self.pre_load_features(dataloader=dataloader)
@@ -268,12 +313,9 @@ class ClipAdapter:
         affinity = features @ self.cache_keys
         clip_logits = 100.0 * features @ self.text_features.t()
         for beta in beta_list:
-            for alpha in alpha_list:
-                cache_logits = (
-                    (-1) * (beta - beta * affinity)
-                ).exp() @ self.cache_values
-
-                fused_logits = clip_logits + cache_logits * alpha
+            cache_logits = ((-1) * (beta - beta * affinity)).exp() @ self.cache_values
+            if alpha_train:
+                fused_logits = clip_logits + self.alpha_matrix(cache_logits)
                 probs = fused_logits.softmax(dim=-1)
                 pred_label = probs.argmax(dim=1)
                 accuracy = metrics.accuracy_score(
@@ -281,19 +323,30 @@ class ClipAdapter:
                 )
 
                 if accuracy > best_acc:
-                    print(
-                        "New best setting, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
-                            beta, alpha, accuracy
-                        )
-                    )
                     best_acc = accuracy
                     best_beta = beta
                     best_alpha = alpha
+            else:
+                for alpha in alpha_list:
+                    fused_logits = clip_logits + cache_logits * alpha
+                    probs = fused_logits.softmax(dim=-1)
+                    pred_label = probs.argmax(dim=1)
+                    accuracy = metrics.accuracy_score(
+                        labels.cpu().numpy(), pred_label.cpu().numpy()
+                    )
+
+                    if accuracy > best_acc:
+                        best_acc = accuracy
+                        best_beta = beta
+                        best_alpha = alpha
+        print(
+            "New best HP, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
+                best_beta, best_alpha, best_acc
+            )
+        )
         if inplace:
             self.cfg["alpha"] = best_alpha
             self.cfg["beta"] = best_beta
-        print("\nAfter searching, the best accuarcy: {:.2f}.\n".format(best_acc))
-
         return best_beta, best_alpha
 
     def _fuse_logits(self, image_featrues, clip_logits, alpha, beta):
