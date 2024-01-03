@@ -27,7 +27,7 @@ class ClipAdapter:
         self.device = device
 
         self.text_features = self._encoder_text()
-        if not manual_cache:
+        if not manual_cache and dataloader is not None:
             self.cache_keys, self.cache_values = self._bulid_cache(
                 dataloader, self.cfg["augment_epoch"]
             )
@@ -286,6 +286,30 @@ class ClipAdapter:
         print(
             f"**** After fine-tuning, Tip-Adapter-F's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n"
         )
+
+    def save(self, filepath):
+        params = {
+            "alpha": self.cfg["alpha"],
+            "beta": self.cfg["beta"],
+        }
+        if hasattr(self, "cache_keys"):
+            params["cache_keys"] = self.cache_keys.cpu()
+        if hasattr(self, "cache_values"):
+            params["cache_values"] = self.cache_values.cpu()
+        if hasattr(self, "alpha_matrix"):
+            params["alpha_matrix"] = self.alpha_matrix.cpu()
+        torch.save(params, filepath)
+
+    def load(self, filepath):
+        params = torch.load(filepath)
+        self.cfg["alpha"] = params["alpha"]
+        self.cfg["beta"] = params["beta"]
+        if "cache_keys" in params.keys():
+            self.cache_keys = params["cache_keys"].to(self.device)
+        if "cache_values" in params.keys():
+            self.cache_values = params["cache_values"].to(self.device)
+        if "alpha_matrix" in params.keys():
+            self.alpha_matrix = params["alpha_matrix"].to(self.device)
 
     def search_hp(
         self,
