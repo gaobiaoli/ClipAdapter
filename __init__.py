@@ -1,3 +1,3 @@
-from adapter import ClipAdapter
-from dataset.CoCoDataset import CoCoDataset
-from dataset.DirDataset import DirDataset
+from .adapter import ClipAdapter
+from .dataset import CoCoDataset
+from .dataset import DirDataset
