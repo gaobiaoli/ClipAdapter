@@ -78,9 +78,12 @@ class CoCoDataset(Dataset):
             int(bbox[0] + bbox[2]),
             int(bbox[1] + bbox[3]),
         ]
-        instance = cv2.cvtColor(
-            self._crop(img, bbox, expansion_ratio=0.1, square=True), cv2.COLOR_BGR2RGB
-        )
+        try:
+            instance = cv2.cvtColor(
+                self._crop(img, bbox, expansion_ratio=0.1, square=True), cv2.COLOR_BGR2RGB
+            )
+        except:
+            return self.__getitem__(index=index+1)
         if self.transform is not None:
             instance_tensor = self.transform(Image.fromarray(instance))
             return (
