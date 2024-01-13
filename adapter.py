@@ -168,6 +168,7 @@ class ClipAdapter:
         dataloader_eval=None,
         search_hp=True,
         alpha_train=False,
+        beta_train=False
     ):
         if dataloader_eval is not None:
             test_features, test_labels = self.pre_load_features(
@@ -192,19 +193,37 @@ class ClipAdapter:
                     ).half()
                 ).to(self.device)
             )
+            lr_list=[
+                    {"params": self.alpha_matrix.parameters(), "lr": 0.05},
+                ]
+            if beta_train:
+                self.beta_matrix = nn.Linear(
+                    self.cache_keys.shape[1], self.cache_keys.shape[1], bias=False
+                ).to(self.device)
+                self.beta_matrix.weight = nn.Parameter(
+                    torch.diag(
+                        torch.tensor(
+                            [self.cfg["beta"]] * self.cache_keys.shape[1]
+                        ).half()
+                    ).to(self.device)
+                )
+                lr_list.append({"params": self.beta_matrix.parameters(), "lr": 0.001})
+
+
+            for param in adapter.parameters():
+                param.requires_grad = False
             optimizer = torch.optim.AdamW(
-                [
-                    {"params": self.alpha_matrix.parameters(), "lr": 0.01},
-                    {"params": adapter.parameters(), "lr": 0.001 * 0.01},
-                ],
+                lr_list,
                 eps=1e-4,
+            )
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=epoch * len(dataloader) * 0.5
             )
         else:
             optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.001, eps=1e-4)
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, epoch * len(dataloader)
-        )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, epoch * len(dataloader)
+            )
 
         best_acc, best_epoch = 0.0, 0
 
@@ -220,21 +239,10 @@ class ClipAdapter:
                 with torch.no_grad():
                     image_features = self.model.encode_image(images)
                     image_features /= image_features.norm(dim=-1, keepdim=True)
-
-                affinity = adapter(image_features)
-                cache_logits = (
-                    (-1) * (self.cfg["beta"] - self.cfg["beta"] * affinity)
-                ).exp() @ self.cache_values
-                #
-                # clip_logits = 100.0 * image_features @ self.text_features.t()
-                # fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
-                # loss = F.cross_entropy(fused_logits, target)
-                #
                 clip_logits = 100.0 * image_features @ self.text_features.t()
-                if alpha_train:
-                    fused_logits = clip_logits + self.alpha_matrix(cache_logits)
-                else:
-                    fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
+
+
+                fused_logits = self._fuse_logits(image_featrues=image_features, clip_logits=clip_logits, adapter=adapter)
                 loss = F.cross_entropy(fused_logits, target)
                 #
                 probs = fused_logits.softmax(dim=-1)
@@ -262,29 +270,27 @@ class ClipAdapter:
                 )
             )
             if search_hp:
-                self.search_hp()
-
+                self.search_hp(alpha_train=alpha_train)
             adapter.eval()
-            affinity = adapter(test_features)
-            cache_logits = (
-                (-1) * (self.cfg["beta"] - self.cfg["beta"] * affinity)
-            ).exp() @ self.cache_values
             clip_logits = 100.0 * test_features @ self.text_features.t()
-            if alpha_train:
-                fused_logits = clip_logits + self.alpha_matrix(cache_logits)
-            else:
-                fused_logits = clip_logits + cache_logits * self.cfg["alpha"]
+            fused_logits = self._fuse_logits(image_featrues=test_features,clip_logits=clip_logits,adapter=adapter)
             probs = fused_logits.softmax(dim=-1)
             pred_label = probs.argmax(dim=1)
             accuracy = metrics.accuracy_score(
                 test_labels.cpu().numpy(), pred_label.cpu().numpy()
             )
-            print("**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(accuracy))
+            print("**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(accuracy*100))
+            if hasattr(self,"beta_matrix"):
+                print("Beta:{}\n".format(self.beta_matrix.weight))
+            if hasattr(self,"alpha_matrix"):
+                print("Alpha:{}\n".format(self.alpha_matrix.weight))
+
+            
             if accuracy > best_acc:
                 best_acc = accuracy
                 best_epoch = train_idx
         print(
-            f"**** After fine-tuning, Tip-Adapter-F's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n"
+            f"**** After fine-tuning, Tip-Adapter-F's best test accuracy: {best_acc*100:.2f}, at epoch: {best_epoch}. ****\n"
         )
 
     def save(self, filepath):
@@ -298,6 +304,8 @@ class ClipAdapter:
             params["cache_values"] = self.cache_values.cpu()
         if hasattr(self, "alpha_matrix"):
             params["alpha_matrix"] = self.alpha_matrix.cpu()
+        if hasattr(self, "beta_matrix"):
+            params["beta_matrix"] = self.beta_matrix.cpu()
         torch.save(params, filepath)
 
     def load(self, filepath):
@@ -310,7 +318,9 @@ class ClipAdapter:
             self.cache_values = params["cache_values"].to(self.device)
         if "alpha_matrix" in params.keys():
             self.alpha_matrix = params["alpha_matrix"].to(self.device)
-
+        if "beta_matrix" in params.keys():
+            self.beta_matrix = params["beta_matrix"].to(self.device)
+            
     def search_hp(
         self,
         dataloader=None,
@@ -349,7 +359,8 @@ class ClipAdapter:
                 if accuracy > best_acc:
                     best_acc = accuracy
                     best_beta = beta
-                    best_alpha = alpha
+                    best_alpha = self.alpha_matrix.weight
+                
             else:
                 for alpha in alpha_list:
                     fused_logits = clip_logits + cache_logits * alpha
@@ -363,33 +374,55 @@ class ClipAdapter:
                         best_acc = accuracy
                         best_beta = beta
                         best_alpha = alpha
-        print(
-            "New best HP, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
-                best_beta, best_alpha, best_acc
-            )
-        )
+                
+        if alpha_train:
+            print(
+                    "New best HP, beta: {:.2f}, alpha: {}; accuracy: {:.2f}".format(
+                        best_beta, best_alpha, best_acc*100
+                    )
+                )
+        else:
+            print(
+                    "New best HP, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
+                        best_beta, best_alpha, best_acc*100
+                    )
+                )
+
         if inplace:
             self.cfg["alpha"] = best_alpha
             self.cfg["beta"] = best_beta
         return best_beta, best_alpha
 
-    def _fuse_logits(self, image_featrues, clip_logits, alpha, beta):
-        with torch.no_grad():
-            if hasattr(self, "cache_keys") and hasattr(self, "cache_values"):
-                affinity = image_featrues @ self.cache_keys
-                cache_logits = ((-1) * beta * (1 - affinity)).exp() @ self.cache_values
-                tip_logits = clip_logits + cache_logits * alpha
-                return tip_logits
+    def _fuse_logits(self, image_featrues, clip_logits, adapter=None,alpha=None, beta=None):
+        if alpha is None and not hasattr(self,"alpha_matrix"):
+            alpha = self.cfg['alpha']
+        if beta is None and not hasattr(self,"beta_matrix"):
+            beta = self.cfg["beta"]
+        
+        if hasattr(self, "cache_keys") and hasattr(self, "cache_values"):
+            if adapter is not None:
+                affinity=adapter(image_featrues)
             else:
-                warnings.warn("No Cached Error, Turn to Plain Mode")
-                return clip_logits
+                affinity = image_featrues @ self.cache_keys
+
+            if hasattr(self,"beta_matrix"):
+                sharpness = self.beta_matrix(1 - affinity)
+            else:
+                sharpness = beta * (1 - affinity)
+            cache_logits = ((-1) * sharpness).exp() @ self.cache_values
+
+            if hasattr(self,"alpha_matrix"):
+                tip_logits = clip_logits + self.alpha_matrix(cache_logits)
+            else:
+                tip_logits = clip_logits + cache_logits * alpha
+
+            return tip_logits
+        else:
+            warnings.warn("No Cached Error, Turn to Plain Mode")
+            return clip_logits
 
     @torch.no_grad()
     def __call__(self, images, adapt=True, alpha=None, beta=None):
-        if alpha is None:
-            alpha = self.cfg["alpha"]
-        if beta is None:
-            beta = self.cfg["beta"]
         images = images.to(self.device)
         image_features = self.model.encode_image(images)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
