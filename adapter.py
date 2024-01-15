@@ -16,7 +16,7 @@ class Alpha(nn.Module):
     def __str__(self) -> str:
         return self.weight
     
-class ClipAdapter(nn.Module):
+class ClipAdapter:
     def __init__(
         self,
         model,
@@ -28,7 +28,6 @@ class ClipAdapter(nn.Module):
         device="cuda:0",
         manual_cache=False,
     ) -> None:
-        super().__init__()
         self.model = model
         self.alpha = alpha
         self.cfg = {"alpha": alpha, "beta": beta, "augment_epoch": augment_epoch}
