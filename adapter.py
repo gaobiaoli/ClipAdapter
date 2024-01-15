@@ -5,9 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn import metrics
+import copy
 
-
-class ClipAdapter:
+class Alpha(nn.Module):
+    def __init__(self,num_classes,alpha):
+        super(Alpha, self).__init__()
+        self.weight=nn.Parameter(alpha*torch.ones(num_classes,1).half())
+    def forward(self,x):
+        return x*self.weight.t()
+    def __str__(self) -> str:
+        return self.weight
+    
+class ClipAdapter(nn.Module):
     def __init__(
         self,
         model,
@@ -19,6 +28,7 @@ class ClipAdapter:
         device="cuda:0",
         manual_cache=False,
     ) -> None:
+        super().__init__()
         self.model = model
         self.alpha = alpha
         self.cfg = {"alpha": alpha, "beta": beta, "augment_epoch": augment_epoch}
@@ -65,7 +75,7 @@ class ClipAdapter:
         cache_keys /= cache_keys.norm(dim=-1, keepdim=True)
         cache_keys = cache_keys.permute(1, 0).to(self.device)
         cache_values = F.one_hot(torch.cat(cache_values, dim=0)).half().to(self.device)
-
+        
         return cache_keys, cache_values
 
     def add_cache(self, img_feature, label):
@@ -177,24 +187,28 @@ class ClipAdapter:
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
             test_features, test_labels = self.test_features, self.test_labels
 
+
+
         # Enable the cached keys to be learnable
         adapter = nn.Linear(
             self.cache_keys.shape[0], self.cache_keys.shape[1], bias=False
         ).to(self.device)
         adapter.weight = nn.Parameter(self.cache_keys.t())
         if alpha_train:
-            self.alpha_matrix = nn.Linear(
-                self.cache_values.shape[1], self.cache_values.shape[1], bias=False
-            ).to(self.device)
-            self.alpha_matrix.weight = nn.Parameter(
-                torch.diag(
-                    torch.tensor(
-                        [self.cfg["alpha"]] * self.cache_values.shape[1]
-                    ).half()
-                ).to(self.device)
-            )
+            self.alpha_weight=Alpha(self.cache_values.shape[1],self.cfg["alpha"]).to(self.device)
+            # self.alpha_weight = nn.Linear(
+            #     self.cache_values.shape[1], self.cache_values.shape[1], bias=False
+            # ).to(self.device)
+            # self.alpha_weight.weight = nn.Parameter(
+            #     torch.diag(
+            #         torch.tensor(
+            #             [self.cfg["alpha"]] * self.cache_values.shape[1]
+            #         ).half()
+            #     ).to(self.device)
+            # )
             lr_list=[
-                    {"params": self.alpha_matrix.parameters(), "lr": 0.05},
+                    {"params": self.alpha_weight.parameters(), "lr": 0.05},
+                    {"params": adapter.parameters(), "lr": 0.001},
                 ]
             if beta_train:
                 self.beta_matrix = nn.Linear(
@@ -210,21 +224,21 @@ class ClipAdapter:
                 lr_list.append({"params": self.beta_matrix.parameters(), "lr": 0.001})
 
 
-            for param in adapter.parameters():
-                param.requires_grad = False
+            # for param in adapter.parameters():
+            #     param.requires_grad = False
             optimizer = torch.optim.AdamW(
                 lr_list,
                 eps=1e-4,
             )
             scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, step_size=epoch * len(dataloader) * 0.5
+                optimizer, step_size=epoch * len(dataloader), gamma=0.8
             )
         else:
             optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.001, eps=1e-4)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, epoch * len(dataloader)
-            )
-
+            # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            #     optimizer, epoch * len(dataloader),eta_min=0.01*0.1
+            # )
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10000, gamma=0.1, last_epoch=-1)
         best_acc, best_epoch = 0.0, 0
 
         for train_idx in range(epoch):
@@ -282,16 +296,20 @@ class ClipAdapter:
             print("**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(accuracy*100))
             if hasattr(self,"beta_matrix"):
                 print("Beta:{}\n".format(self.beta_matrix.weight))
-            if hasattr(self,"alpha_matrix"):
-                print("Alpha:{}\n".format(self.alpha_matrix.weight))
+            if hasattr(self,"alpha_weight"):
+                print("Alpha:{}\n".format(self.alpha_weight.weight))
 
             
             if accuracy > best_acc:
+                best_adapter_weight = copy.deepcopy(adapter.state_dict())
+                best_alpha_weight = copy.deepcopy(self.alpha_weight.state_dict())
                 best_acc = accuracy
                 best_epoch = train_idx
         print(
             f"**** After fine-tuning, Tip-Adapter-F's best test accuracy: {best_acc*100:.2f}, at epoch: {best_epoch}. ****\n"
         )
+        adapter.load_state_dict(best_adapter_weight)
+        self.alpha_weight.load_state_dict(best_alpha_weight)
 
     def save(self, filepath):
         params = {
@@ -302,8 +320,8 @@ class ClipAdapter:
             params["cache_keys"] = self.cache_keys.cpu()
         if hasattr(self, "cache_values"):
             params["cache_values"] = self.cache_values.cpu()
-        if hasattr(self, "alpha_matrix"):
-            params["alpha_matrix"] = self.alpha_matrix.cpu()
+        if hasattr(self, "alpha_weight"):
+            params["alpha_weight"] = self.alpha_weight.cpu()
         if hasattr(self, "beta_matrix"):
             params["beta_matrix"] = self.beta_matrix.cpu()
         torch.save(params, filepath)
@@ -316,11 +334,10 @@ class ClipAdapter:
             self.cache_keys = params["cache_keys"].to(self.device)
         if "cache_values" in params.keys():
             self.cache_values = params["cache_values"].to(self.device)
-        if "alpha_matrix" in params.keys():
-            self.alpha_matrix = params["alpha_matrix"].to(self.device)
+        if "alpha_weight" in params.keys():
+            self.alpha_weight = params["alpha_weight"].to(self.device)
         if "beta_matrix" in params.keys():
             self.beta_matrix = params["beta_matrix"].to(self.device)
-            
     def search_hp(
         self,
         dataloader=None,
@@ -337,6 +354,7 @@ class ClipAdapter:
             i * (search_scale[0] - 0.1) / search_step[0] + 0.1
             for i in range(search_step[0])
         ]
+        beta_list=[1]
         alpha_list = [
             i * (search_scale[1] - 0.1) / search_step[1] + 0.1
             for i in range(search_step[1])
@@ -349,7 +367,7 @@ class ClipAdapter:
         for beta in beta_list:
             cache_logits = ((-1) * (beta - beta * affinity)).exp() @ self.cache_values
             if alpha_train:
-                fused_logits = clip_logits + self.alpha_matrix(cache_logits)
+                fused_logits = clip_logits + self.alpha_weight(cache_logits)
                 probs = fused_logits.softmax(dim=-1)
                 pred_label = probs.argmax(dim=1)
                 accuracy = metrics.accuracy_score(
@@ -359,7 +377,7 @@ class ClipAdapter:
                 if accuracy > best_acc:
                     best_acc = accuracy
                     best_beta = beta
-                    best_alpha = self.alpha_matrix.weight
+                    best_alpha = self.alpha_weight.weight
                 
             else:
                 for alpha in alpha_list:
@@ -394,7 +412,7 @@ class ClipAdapter:
         return best_beta, best_alpha
 
     def _fuse_logits(self, image_featrues, clip_logits, adapter=None,alpha=None, beta=None):
-        if alpha is None and not hasattr(self,"alpha_matrix"):
+        if alpha is None and not hasattr(self,"alpha_weight"):
             alpha = self.cfg['alpha']
         if beta is None and not hasattr(self,"beta_matrix"):
             beta = self.cfg["beta"]
@@ -411,8 +429,8 @@ class ClipAdapter:
                 sharpness = beta * (1 - affinity)
             cache_logits = ((-1) * sharpness).exp() @ self.cache_values
 
-            if hasattr(self,"alpha_matrix"):
-                tip_logits = clip_logits + self.alpha_matrix(cache_logits)
+            if hasattr(self,"alpha_weight"):
+                tip_logits = clip_logits + self.alpha_weight(cache_logits)
             else:
                 tip_logits = clip_logits + cache_logits * alpha
 
