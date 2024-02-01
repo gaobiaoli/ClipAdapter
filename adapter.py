@@ -7,38 +7,42 @@ from tqdm import tqdm
 from sklearn import metrics
 import copy
 
+
 class Alpha(nn.Module):
-    def __init__(self,num_classes,alpha):
+    def __init__(self, num_classes, alpha):
         super(Alpha, self).__init__()
-        self.weight=nn.Parameter(alpha*torch.ones(num_classes,1).half())
-    def forward(self,x):
-        return x*self.weight.t()
+        self.weight = nn.Parameter(alpha * torch.ones(num_classes, 1).half())
+
+    def forward(self, x):
+        return x * self.weight.t()
+
     def __str__(self) -> str:
         return self.weight
-    
-class ClipAdapter:
+
+
+class ClipAdapter(nn.Module):
     def __init__(
         self,
         model,
         dataloader=None,
         classnames=None,
-        alpha=20,
-        beta=20,
+        alpha=5,
+        beta=1,
         augment_epoch=10,
         device="cuda:0",
         manual_cache=False,
     ) -> None:
+        super().__init__()
         self.model = model
         self.alpha = alpha
-        self.cfg = {"alpha": alpha, "beta": beta, "augment_epoch": augment_epoch}
-
+        self.beta = beta
+        self.augment_epoch = augment_epoch
         self.classnames = classnames
         self.device = device
-
         self.text_features = self._encoder_text()
         if not manual_cache and dataloader is not None:
             self.cache_keys, self.cache_values = self._bulid_cache(
-                dataloader, self.cfg["augment_epoch"]
+                dataloader, self.augment_epoch
             )
 
     def reset_text(self, texts):
@@ -52,29 +56,27 @@ class ClipAdapter:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
 
+    @torch.no_grad()
     def _bulid_cache(self, dataloader, augment_epoch):
         cache_keys = []
         cache_values = []
 
-        with torch.no_grad():
-            # Data augmentation for the cache model
-            for augment_idx in range(augment_epoch):
-                train_features = []
-
-                print("Augment Epoch: {:} / {:}".format(augment_idx, augment_epoch))
-                for i, (images, target, _) in enumerate(tqdm(dataloader)):
-                    image_features = self.model.encode_image(images.to(self.device))
-                    train_features.append(image_features)
-                    if augment_idx == 0:
-                        target = target.cuda()
-                        cache_values.append(target)
-                cache_keys.append(torch.cat(train_features, dim=0).unsqueeze(0))
+        for augment_idx in range(augment_epoch):
+            train_features = []
+            print("Augment Epoch: {:} / {:}".format(augment_idx, augment_epoch))
+            for i, (images, target, _) in enumerate(tqdm(dataloader)):
+                image_features = self.model.encode_image(images.to(self.device))
+                train_features.append(image_features)
+                if augment_idx == 0:
+                    target = target.cuda()
+                    cache_values.append(target)
+            cache_keys.append(torch.cat(train_features, dim=0).unsqueeze(0))
 
         cache_keys = torch.cat(cache_keys, dim=0).mean(dim=0)
         cache_keys /= cache_keys.norm(dim=-1, keepdim=True)
         cache_keys = cache_keys.permute(1, 0).to(self.device)
         cache_values = F.one_hot(torch.cat(cache_values, dim=0)).half().to(self.device)
-        
+
         return cache_keys, cache_values
 
     def add_cache(self, img_feature, label):
@@ -110,7 +112,7 @@ class ClipAdapter:
 
     def rebulid_cache(self, dataloader, augment_epoch=None):
         if augment_epoch is None:
-            augment_epoch = self.cfg["augment_epoch"]
+            augment_epoch = self.augment_epoch
         self.cache_keys, self.cache_values = self._bulid_cache(
             dataloader=dataloader, augment_epoch=augment_epoch
         )
@@ -135,9 +137,9 @@ class ClipAdapter:
 
     def eval(self, dataloader=None, adapt=True, alpha=None, beta=None):
         if alpha is None:
-            alpha = self.cfg["alpha"]
+            alpha = self.alpha
         if beta is None:
-            beta = self.cfg["beta"]
+            beta = self.beta
         if dataloader is not None:
             all_targets = []
             all_predictions = []
@@ -177,7 +179,7 @@ class ClipAdapter:
         dataloader_eval=None,
         search_hp=True,
         alpha_train=False,
-        beta_train=False
+        beta_train=False,
     ):
         if dataloader_eval is not None:
             test_features, test_labels = self.pre_load_features(
@@ -186,42 +188,27 @@ class ClipAdapter:
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
             test_features, test_labels = self.test_features, self.test_labels
 
-
-
         # Enable the cached keys to be learnable
         adapter = nn.Linear(
             self.cache_keys.shape[0], self.cache_keys.shape[1], bias=False
         ).to(self.device)
         adapter.weight = nn.Parameter(self.cache_keys.t())
         if alpha_train:
-            self.alpha_weight=Alpha(self.cache_values.shape[1],self.cfg["alpha"]).to(self.device)
-            # self.alpha_weight = nn.Linear(
-            #     self.cache_values.shape[1], self.cache_values.shape[1], bias=False
-            # ).to(self.device)
-            # self.alpha_weight.weight = nn.Parameter(
-            #     torch.diag(
-            #         torch.tensor(
-            #             [self.cfg["alpha"]] * self.cache_values.shape[1]
-            #         ).half()
-            #     ).to(self.device)
-            # )
-            lr_list=[
-                    {"params": self.alpha_weight.parameters(), "lr": 0.05},
-                    {"params": adapter.parameters(), "lr": 0.001},
-                ]
+            self.alpha_weight = Alpha(len(self.classnames), self.alpha).to(self.device)
+            lr_list = [
+                {"params": self.alpha_weight.parameters(), "lr": 0.05},
+                {"params": adapter.parameters(), "lr": 0.001},
+            ]
             if beta_train:
                 self.beta_matrix = nn.Linear(
                     self.cache_keys.shape[1], self.cache_keys.shape[1], bias=False
                 ).to(self.device)
                 self.beta_matrix.weight = nn.Parameter(
                     torch.diag(
-                        torch.tensor(
-                            [self.cfg["beta"]] * self.cache_keys.shape[1]
-                        ).half()
+                        torch.tensor([self.beta] * self.cache_keys.shape[1]).half()
                     ).to(self.device)
                 )
                 lr_list.append({"params": self.beta_matrix.parameters(), "lr": 0.001})
-
 
             # for param in adapter.parameters():
             #     param.requires_grad = False
@@ -235,13 +222,14 @@ class ClipAdapter:
         else:
             optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.001, eps=1e-4)
             # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            #     optimizer, epoch * len(dataloader),eta_min=0.01*0.1
+            #     optimizer, epoch * len(dataloader), eta_min=0.01 * 0.1
             # )
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10000, gamma=0.1, last_epoch=-1)
-        best_acc, best_epoch = 0.0, 0
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, epoch * len(dataloader) / 2, gamma=0.8, last_epoch=-1
+            )
 
+        best_acc, best_epoch = 0.0, 0
         for train_idx in range(epoch):
-            # Train
             adapter.train()
             correct_samples, all_samples = 0, 0
             loss_list = []
@@ -254,8 +242,11 @@ class ClipAdapter:
                     image_features /= image_features.norm(dim=-1, keepdim=True)
                 clip_logits = 100.0 * image_features @ self.text_features.t()
 
-
-                fused_logits = self._fuse_logits(image_featrues=image_features, clip_logits=clip_logits, adapter=adapter)
+                fused_logits = self._fuse_logits(
+                    image_featrues=image_features,
+                    clip_logits=clip_logits,
+                    adapter=adapter,
+                )
                 loss = F.cross_entropy(fused_logits, target)
                 #
                 probs = fused_logits.softmax(dim=-1)
@@ -286,34 +277,41 @@ class ClipAdapter:
                 self.search_hp(alpha_train=alpha_train)
             adapter.eval()
             clip_logits = 100.0 * test_features @ self.text_features.t()
-            fused_logits = self._fuse_logits(image_featrues=test_features,clip_logits=clip_logits,adapter=adapter)
+            fused_logits = self._fuse_logits(
+                image_featrues=test_features, clip_logits=clip_logits, adapter=adapter
+            )
             probs = fused_logits.softmax(dim=-1)
             pred_label = probs.argmax(dim=1)
             accuracy = metrics.accuracy_score(
                 test_labels.cpu().numpy(), pred_label.cpu().numpy()
             )
-            print("**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(accuracy*100))
-            if hasattr(self,"beta_matrix"):
+            print(
+                "**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(
+                    accuracy * 100
+                )
+            )
+            if hasattr(self, "beta_matrix"):
                 print("Beta:{}\n".format(self.beta_matrix.weight))
-            if hasattr(self,"alpha_weight"):
+            if hasattr(self, "alpha_weight"):
                 print("Alpha:{}\n".format(self.alpha_weight.weight))
 
-            
             if accuracy > best_acc:
                 best_adapter_weight = copy.deepcopy(adapter.state_dict())
-                best_alpha_weight = copy.deepcopy(self.alpha_weight.state_dict())
+                if alpha_train:
+                    best_alpha_weight = copy.deepcopy(self.alpha_weight.state_dict())
                 best_acc = accuracy
                 best_epoch = train_idx
         print(
             f"**** After fine-tuning, Tip-Adapter-F's best test accuracy: {best_acc*100:.2f}, at epoch: {best_epoch}. ****\n"
         )
         adapter.load_state_dict(best_adapter_weight)
-        self.alpha_weight.load_state_dict(best_alpha_weight)
+        if alpha_train:
+            self.alpha_weight.load_state_dict(best_alpha_weight)
 
     def save(self, filepath):
         params = {
-            "alpha": self.cfg["alpha"],
-            "beta": self.cfg["beta"],
+            "alpha": self.alpha,
+            "beta": self.beta,
         }
         if hasattr(self, "cache_keys"):
             params["cache_keys"] = self.cache_keys.cpu()
@@ -327,8 +325,8 @@ class ClipAdapter:
 
     def load(self, filepath):
         params = torch.load(filepath)
-        self.cfg["alpha"] = params["alpha"]
-        self.cfg["beta"] = params["beta"]
+        self.alpha = params["alpha"]
+        self.beta = params["beta"]
         if "cache_keys" in params.keys():
             self.cache_keys = params["cache_keys"].to(self.device)
         if "cache_values" in params.keys():
@@ -337,6 +335,7 @@ class ClipAdapter:
             self.alpha_weight = params["alpha_weight"].to(self.device)
         if "beta_matrix" in params.keys():
             self.beta_matrix = params["beta_matrix"].to(self.device)
+
     def search_hp(
         self,
         dataloader=None,
@@ -353,7 +352,7 @@ class ClipAdapter:
             i * (search_scale[0] - 0.1) / search_step[0] + 0.1
             for i in range(search_step[0])
         ]
-        beta_list=[1]
+        # beta_list=[1]
         alpha_list = [
             i * (search_scale[1] - 0.1) / search_step[1] + 0.1
             for i in range(search_step[1])
@@ -377,7 +376,7 @@ class ClipAdapter:
                     best_acc = accuracy
                     best_beta = beta
                     best_alpha = self.alpha_weight.weight
-                
+
             else:
                 for alpha in alpha_list:
                     fused_logits = clip_logits + cache_logits * alpha
@@ -391,44 +390,46 @@ class ClipAdapter:
                         best_acc = accuracy
                         best_beta = beta
                         best_alpha = alpha
-                
+
         if alpha_train:
             print(
-                    "New best HP, beta: {:.2f}, alpha: {}; accuracy: {:.2f}".format(
-                        best_beta, best_alpha, best_acc*100
-                    )
+                "New best HP, beta: {:.2f}, alpha: {}; accuracy: {:.2f}".format(
+                    best_beta, best_alpha, best_acc * 100
                 )
+            )
         else:
             print(
-                    "New best HP, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
-                        best_beta, best_alpha, best_acc*100
-                    )
+                "New best HP, beta: {:.2f}, alpha: {:.2f}; accuracy: {:.2f}".format(
+                    best_beta, best_alpha, best_acc * 100
                 )
+            )
 
         if inplace:
-            self.cfg["alpha"] = best_alpha
-            self.cfg["beta"] = best_beta
+            self.alpha = best_alpha
+            self.beta = best_beta
         return best_beta, best_alpha
 
-    def _fuse_logits(self, image_featrues, clip_logits, adapter=None,alpha=None, beta=None):
-        if alpha is None and not hasattr(self,"alpha_weight"):
-            alpha = self.cfg['alpha']
-        if beta is None and not hasattr(self,"beta_matrix"):
-            beta = self.cfg["beta"]
-        
+    def _fuse_logits(
+        self, image_featrues, clip_logits, adapter=None, alpha=None, beta=None
+    ):
+        if alpha is None and not hasattr(self, "alpha_weight"):
+            alpha = self.alpha
+        if beta is None and not hasattr(self, "beta_matrix"):
+            beta = self.beta
+
         if hasattr(self, "cache_keys") and hasattr(self, "cache_values"):
             if adapter is not None:
-                affinity=adapter(image_featrues)
+                affinity = adapter(image_featrues)
             else:
                 affinity = image_featrues @ self.cache_keys
 
-            if hasattr(self,"beta_matrix"):
+            if hasattr(self, "beta_matrix"):
                 sharpness = self.beta_matrix(1 - affinity)
             else:
                 sharpness = beta * (1 - affinity)
             cache_logits = ((-1) * sharpness).exp() @ self.cache_values
 
-            if hasattr(self,"alpha_weight"):
+            if hasattr(self, "alpha_weight"):
                 tip_logits = clip_logits + self.alpha_weight(cache_logits)
             else:
                 tip_logits = clip_logits + cache_logits * alpha
