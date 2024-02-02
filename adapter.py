@@ -61,10 +61,9 @@ class ClipAdapter(nn.Module):
         cache_keys = []
         cache_values = []
 
-        for augment_idx in range(augment_epoch):
+        for augment_idx in tqdm(range(augment_epoch)):
             train_features = []
-            print("Augment Epoch: {:} / {:}".format(augment_idx, augment_epoch))
-            for i, (images, target, _) in enumerate(tqdm(dataloader)):
+            for i, (images, target, _) in enumerate(dataloader):
                 image_features = self.model.encode_image(images.to(self.device))
                 train_features.append(image_features)
                 if augment_idx == 0:
@@ -342,17 +341,19 @@ class ClipAdapter(nn.Module):
         search_scale=[50, 50],
         search_step=[200, 20],
         inplace=True,
+        beta_search=False,
         alpha_train=False,
     ):
         if dataloader is not None:
             features, labels = self.pre_load_features(dataloader=dataloader)
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
             features, labels = self.test_features, self.test_labels
-        beta_list = [
-            i * (search_scale[0] - 0.1) / search_step[0] + 0.1
-            for i in range(search_step[0])
-        ]
-        # beta_list=[1]
+        beta_list = [1]
+        if beta_search:
+            beta_list = [
+                i * (search_scale[0] - 0.1) / search_step[0] + 0.1
+                for i in range(search_step[0])
+            ]
         alpha_list = [
             i * (search_scale[1] - 0.1) / search_step[1] + 0.1
             for i in range(search_step[1])
@@ -407,7 +408,7 @@ class ClipAdapter(nn.Module):
         if inplace:
             self.alpha = best_alpha
             self.beta = best_beta
-        return best_beta, best_alpha
+        return best_beta, best_alpha, best_acc * 100
 
     def _fuse_logits(
         self, image_featrues, clip_logits, adapter=None, alpha=None, beta=None
