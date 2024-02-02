@@ -37,7 +37,7 @@ class CoCoDataset(Dataset):
         else:
             self.instance_ids = instance_ids
         self.category_init_id = category_init_id
-    
+
     @property
     def classnames(self):
         return [category["name"] for category in self.coco.dataset["categories"]]
@@ -65,9 +65,8 @@ class CoCoDataset(Dataset):
             partIds.extend(annIds[0:num])
         return partIds
 
-    def get_instance(self,instance_id):
+    def get_instance(self, instance_id):
         anns = self.coco.loadAnns(ids=[instance_id])[0]
-
         image_id = anns["image_id"]
         img_info = self.coco.loadImgs(ids=[image_id])[0]
         img = cv2.imread(os.path.join(self.imgs_path, img_info["file_name"]))
@@ -78,33 +77,19 @@ class CoCoDataset(Dataset):
             int(bbox[0] + bbox[2]),
             int(bbox[1] + bbox[3]),
         ]
-        try:
-            instance = cv2.cvtColor(
-                self._crop(img, bbox, expansion_ratio=0.1, square=True), cv2.COLOR_BGR2RGB
-            )
-        except:
-            return self.get_instance(instance_id=instance_id+1)
+        instance = cv2.cvtColor(
+            self._crop(img, bbox, expansion_ratio=0.1, square=True), cv2.COLOR_BGR2RGB
+        )
+
         return instance
-    
-    def __getitem__(self, index):
-        anns = self.coco.loadAnns(ids=[self.instance_ids[index]])[0]
 
-        image_id = anns["image_id"]
-        img_info = self.coco.loadImgs(ids=[image_id])[0]
-        img = cv2.imread(os.path.join(self.imgs_path, img_info["file_name"]))
-        bbox = anns["bbox"]
-        bbox = [
-            int(bbox[0]),
-            int(bbox[1]),
-            int(bbox[0] + bbox[2]),
-            int(bbox[1] + bbox[3]),
-        ]
+    def __getitem__(self, index):
+        instance_id = self.instance_ids[index]
+        anns = self.coco.loadAnns(ids=[self.instance_ids[index]])[0]
         try:
-            instance = cv2.cvtColor(
-                self._crop(img, bbox, expansion_ratio=0.1, square=True), cv2.COLOR_BGR2RGB
-            )
+            instance = self.get_instance(instance_id=instance_id)
         except:
-            return self.__getitem__(index=index+1)
+            return self.__getitem__(index=index + 1)
         if self.transform is not None:
             instance_tensor = self.transform(Image.fromarray(instance))
             return (
