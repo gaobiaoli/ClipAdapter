@@ -224,7 +224,7 @@ class ClipAdapter(nn.Module):
             #     optimizer, epoch * len(dataloader), eta_min=0.01 * 0.1
             # )
             scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, epoch * len(dataloader) / 2, gamma=0.8, last_epoch=-1
+                optimizer, min(epoch * len(dataloader) / 2,10 * len(dataloader)), gamma=0.8, last_epoch=-1
             )
 
         best_acc, best_epoch = 0.0, 0

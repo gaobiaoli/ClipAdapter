@@ -58,13 +58,14 @@ class DirDataset:
         for catId in list(self.label2img.keys()):
             imgs = self.label2img[catId]
             random.shuffle(imgs)
-            shot_imgs.extend(imgs[0:shot])
-            left_imgs.extend(imgs[shot:])
+            shot_index=int(shot*len(imgs)) if shot<1 else shot
+            shot_imgs.extend(imgs[0:shot_index])
+            left_imgs.extend(imgs[shot_index:])
         return shot_imgs, left_imgs
 
     def reverse(self):
         self.imgs_list, self.left_list = self.left_list, self.imgs_list
-
+    
     def __getitem__(self, idx):
         img = cv2.imread(self.imgs_list[idx])
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -76,7 +77,13 @@ class DirDataset:
     def __len__(self):
         return len(self.imgs_list)
 
-
+    @property
+    def numInfo(self):
+        numdict=defaultdict(int)
+        for img in list(self.imgs_list):
+            numdict[self.img2label[img]] +=1
+        return numdict
+    
 if __name__ == "__main__":
     import torch
 
