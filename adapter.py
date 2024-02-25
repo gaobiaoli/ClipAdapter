@@ -39,7 +39,7 @@ class ClipAdapter(nn.Module):
         self.augment_epoch = augment_epoch
         self.classnames = classnames
         self.device = device
-        self.text_features = self._encoder_text()
+        self.text_features = self._encoder_text().to(self.device)
         if not manual_cache and dataloader is not None:
             self.cache_keys, self.cache_values = self._bulid_cache(
                 dataloader, self.augment_epoch

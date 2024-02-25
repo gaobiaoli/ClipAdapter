@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 import cv2
 import torch.nn.functional as F
 import random
-
+from collections import defaultdict
 
 class DirDataset:
     def __init__(
@@ -22,17 +22,27 @@ class DirDataset:
         self.label_list = []
         self.imgs_list = []
         self.classnames = list(class_dir_map.keys())
-        self.label2img = {}
+        self.label2img = defaultdict(list)
         self.img2label = {}
         self.random_seed = random_seed
         for id, classname in enumerate(list(class_dir_map.keys())):
-            dir_path = os.path.join(self.root, class_dir_map[classname])
-            imgs_file = os.listdir(dir_path)
-            files = [os.path.join(dir_path, img) for img in imgs_file]
-            self.label2img[id] = files
-            for file in files:
-                self.img2label[file] = id
-            self.imgs_list.extend(files)
+            if isinstance(class_dir_map[classname],list):
+                for dir in class_dir_map[classname]:
+                    dir_path = os.path.join(self.root, dir)
+                    imgs_file = os.listdir(dir_path)
+                    files = [os.path.join(dir_path, img) for img in imgs_file]
+                    self.label2img[id].extend(files)
+                    for file in files:
+                        self.img2label[file] = id
+                    self.imgs_list.extend(files)
+            else:     
+                dir_path = os.path.join(self.root, class_dir_map[classname])
+                imgs_file = os.listdir(dir_path)
+                files = [os.path.join(dir_path, img) for img in imgs_file]
+                self.label2img[id].extend(files)
+                for file in files:
+                    self.img2label[file] = id
+                self.imgs_list.extend(files)
         if few_shot is not None:
             self.imgs_list, self.left_list = self.gen_fewshot_imgs(
                 shot=few_shot, random_seed=self.random_seed
