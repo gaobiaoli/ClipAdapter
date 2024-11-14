@@ -116,7 +116,16 @@ class ClipAdapter(nn.Module):
             dataloader=dataloader, augment_epoch=augment_epoch
         )
 
-    def pre_load_features(self, dataloader, store=True):
+    def pre_load_features(self, dataloader, store=True,local=True,save_path='features.pth'):
+        # import os
+        # if local and os.path.exists(save_path):
+        # # Load features and labels from the local file
+        #     data = torch.load(save_path)
+        #     self.test_features = data['features']
+        #     self.test_labels = data['labels']
+        #     self.test_clip_logits = 100.0 * self.test_features @ self.text_features.t()
+        #     return self.test_features, self.test_labels
+
         features, labels = [], []
 
         with torch.no_grad():
@@ -132,6 +141,7 @@ class ClipAdapter(nn.Module):
             self.test_features = features
             self.test_labels = labels
             self.test_clip_logits = 100.0 * features @ self.text_features.t()
+            # torch.save({'features': features, 'labels': labels}, save_path)
         return features, labels
 
     def eval(self, dataloader=None, adapt=True, alpha=None, beta=None):
@@ -343,12 +353,13 @@ class ClipAdapter(nn.Module):
         inplace=True,
         beta_search=False,
         alpha_train=False,
+        print_log = False
     ):
         if dataloader is not None:
             features, labels = self.pre_load_features(dataloader=dataloader)
         elif hasattr(self, "test_features") and hasattr(self, "test_labels"):
             features, labels = self.test_features, self.test_labels
-        beta_list = [1]
+        beta_list = [self.beta]
         if beta_search:
             beta_list = [
                 i * (search_scale[0] - 0.1) / search_step[0] + 0.1
@@ -372,7 +383,8 @@ class ClipAdapter(nn.Module):
                 accuracy = metrics.accuracy_score(
                     labels.cpu().numpy(), pred_label.cpu().numpy()
                 )
-
+                if print_log:
+                        print('Alpha:{} Beta:{} Acc:{:.2f}'.format(alpha,beta,accuracy*100))
                 if accuracy > best_acc:
                     best_acc = accuracy
                     best_beta = beta
@@ -386,12 +398,13 @@ class ClipAdapter(nn.Module):
                     accuracy = metrics.accuracy_score(
                         labels.cpu().numpy(), pred_label.cpu().numpy()
                     )
-
+                    if print_log:
+                        print('Alpha:{} Beta:{} Acc:{:.2f}'.format(alpha,beta,accuracy*100))
                     if accuracy > best_acc:
                         best_acc = accuracy
                         best_beta = beta
                         best_alpha = alpha
-
+            
         if alpha_train:
             print(
                 "New best HP, beta: {:.2f}, alpha: {}; accuracy: {:.2f}".format(
